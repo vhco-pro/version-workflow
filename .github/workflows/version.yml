@@ -1,0 +1,102 @@
+name: Version
+
+# Calculates the version with GitVersion and pushes its exact tag when this run
+# may release: on the default branch, or on a branch with an open PR that has
+# the preview label at this commit. Call it after the caller's checks through
+# `needs:`, so a commit that failed them is never tagged.
+#
+# Permissions are inherited from the caller job, which picks the arrangement:
+# - separate workflows: contents: read, pull-requests: read and a GitHub App,
+#   whose tag push starts the caller's tag-triggered release workflow;
+# - same workflow: contents: write, pull-requests: read and no App. A
+#   GITHUB_TOKEN tag push starts no workflow, so a dependent job in the same run
+#   releases the `tag` output.
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Calculate the version without tagging, on any branch
+        type: boolean
+        default: false
+      preview-label:
+        description: PR label that lets a branch tag prerelease versions. Empty tags the default branch only
+        type: string
+        default: release:preview
+      config-file-path:
+        description: GitVersion configuration in the caller repository. Empty uses the action's bundled one
+        type: string
+        default: ''
+      release-app-client-id:
+        description: GitHub App that pushes the tag. Empty pushes it with the caller's GITHUB_TOKEN
+        type: string
+        default: ''
+    secrets:
+      release-app-private-key:
+        required: false
+    outputs:
+      tagged:
+        description: Whether this run pushed a new exact tag
+        value: ${{ jobs.version.outputs.tagged }}
+      tag:
+        description: The exact tag pushed by this run, or empty
+        value: ${{ jobs.version.outputs.tag }}
+      version:
+        description: GitVersion SemVer of the checked commit
+        value: ${{ jobs.version.outputs.version }}
+
+concurrency:
+  group: version-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tagged: ${{ steps.gitversion.outputs.tagged }}
+      tag: ${{ steps.gitversion.outputs.pushed-tag }}
+      version: ${{ steps.gitversion.outputs.semVer }}
+    steps:
+      - name: Look for an open PR with the preview label at this commit
+        id: preview
+        if: ${{ !inputs.dry-run && inputs.preview-label != '' && github.ref_name != github.event.repository.default_branch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          LABEL: ${{ inputs.preview-label }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "labelled=$(gh pr list --head "$BRANCH" --state open --label "$LABEL" \
+            --json headRefOid --jq "any(.[]; .headRefOid == \"$SHA\")")" >> "$GITHUB_OUTPUT"
+      - name: Decide whether this run tags
+        id: gate
+        env:
+          TAG: ${{ !inputs.dry-run && (github.ref_name == github.event.repository.default_branch || steps.preview.outputs.labelled == 'true') }}
+        run: echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Authenticate as the release App
+        id: app
+        if: ${{ steps.gate.outputs.tag == 'true' && inputs.release-app-client-id != '' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.release-app-client-id }}
+          private-key: ${{ secrets.release-app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      # No `ref:`: checkout then puts the branch at the commit that started the
+      # run, even if the branch has moved since, so only checked code is tagged.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app.outputs.token || github.token }}
+          persist-credentials: ${{ steps.gate.outputs.tag == 'true' }}
+      - name: Calculate the version and push its exact tag when this run tags
+        id: gitversion
+        uses: michielvha/gitversion-tag-action@8cf5869816cf71437052ac97d086e00526bf2d89 # v7.0.4
+        with:
+          prefix: v
+          configFilePath: ${{ inputs.config-file-path }}
+          dry-run: ${{ steps.gate.outputs.tag != 'true' }}
